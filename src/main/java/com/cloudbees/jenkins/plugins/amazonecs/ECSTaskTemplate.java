@@ -25,16 +25,7 @@
 
 package com.cloudbees.jenkins.plugins.amazonecs;
 
-import com.amazonaws.services.ecs.model.AwsVpcConfiguration;
-import com.amazonaws.services.ecs.model.ContainerDefinition;
-import com.amazonaws.services.ecs.model.HostEntry;
-import com.amazonaws.services.ecs.model.PortMapping;
-import com.amazonaws.services.ecs.model.Volume;
-import com.amazonaws.services.ecs.model.HostVolumeProperties;
-import com.amazonaws.services.ecs.model.KeyValuePair;
-import com.amazonaws.services.ecs.model.LaunchType;
-import com.amazonaws.services.ecs.model.MountPoint;
-import com.amazonaws.services.ecs.model.RegisterTaskDefinitionRequest;
+import com.amazonaws.services.ecs.model.*;
 import com.amazonaws.services.ecs.model.Volume;
 import hudson.Extension;
 import hudson.model.AbstractDescribableImpl;
@@ -44,8 +35,8 @@ import hudson.model.labels.LabelAtom;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
 
-import hudson.util.ListBoxModel;
 import org.apache.commons.lang.StringUtils;
+import org.apache.commons.collections.CollectionUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
@@ -58,10 +49,14 @@ import javax.servlet.ServletException;
 import java.io.IOException;
 import java.util.*;
 
+import java.io.Serializable;
+import com.google.common.base.Strings;
+
 /**
  * @author <a href="mailto:nicolas.deloof@gmail.com">Nicolas De Loof</a>
  */
-public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
+public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> implements Serializable {
+    private static final long serialVersionUID = -426721853953018205L;
     /**
      * Template Name
      */
@@ -88,7 +83,7 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     @Nonnull
     private final String image;
     /**
-     * Slave remote FS
+     * Agent remote FS
      */
     @Nullable
     private final String remoteFSRoot;
@@ -170,7 +165,7 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     private String entrypoint;
 
     /**
-     * ARN of the IAM role to use for the slave ECS task
+     * ARN of the IAM role to use for the agent ECS task
      *
      * @see RegisterTaskDefinitionRequest#withTaskRoleArn(String)
      */
@@ -178,21 +173,29 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     private String taskrole;
 
     /**
-     * ARN of the IAM role to use for the slave ECS task
+     * ARN of the IAM role to use for the agent ECS task
      *
      * @see RegisterTaskDefinitionRequest#withExecutionRoleArn(String)
      */
     @CheckForNull
     private String executionRole;
+    
+    /**
+     * ARN of the Secrets Manager to use for the agent ECS task
+     *
+     * @see ContainerDefinition#withRepositoryCredentials(RepositoryCredentials)
+     */
+    @CheckForNull
+    private String repositoryCredentials;    
 
     /**
-      JVM arguments to start slave.jar
+     * JVM arguments to start slave.jar
      */
     @CheckForNull
     private String jvmArgs;
 
     /**
-      Container mount points, imported from volumes
+    * Container mount points, imported from volumes
      */
     private List<MountPointEntry> mountPoints;
 
@@ -201,6 +204,12 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
      */
     @Nonnull
     private final String launchType;
+
+    /**
+     * Task network mode
+     */
+    @Nonnull
+    private final String networkMode;
 
     /**
      * Indicates whether the container should run in privileged mode
@@ -237,12 +246,16 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     private String logDriver;
     private List<LogDriverOption> logDriverOptions;
 
+    private String inheritFrom;
+
     @DataBoundConstructor
     public ECSTaskTemplate(@Nonnull String templateName,
                            @Nullable String label,
                            @Nullable String taskDefinitionOverride,
                            @Nonnull String image,
+                           @Nullable final String repositoryCredentials,
                            @Nonnull String launchType,
+                           @Nonnull String networkMode,
                            @Nullable String remoteFSRoot,
                            int memory,
                            int memoryReservation,
@@ -256,7 +269,9 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
                            @Nullable List<EnvironmentEntry> environments,
                            @Nullable List<ExtraHostEntry> extraHosts,
                            @Nullable List<MountPointEntry> mountPoints,
-                           @Nullable List<PortMappingEntry> portMappings) {
+                           @Nullable List<PortMappingEntry> portMappings,
+                           @Nullable String taskrole,
+                           @Nullable String inheritFrom) {
         // if the user enters a task definition override, always prefer to use it, rather than the jenkins template.
         if (taskDefinitionOverride != null && !taskDefinitionOverride.trim().isEmpty()) {
             this.taskDefinitionOverride = taskDefinitionOverride.trim();
@@ -274,11 +289,13 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
 
         this.label = label;
         this.image = image;
+        this.repositoryCredentials = StringUtils.trimToNull(repositoryCredentials);
         this.remoteFSRoot = remoteFSRoot;
         this.memory = memory;
         this.memoryReservation = memoryReservation;
         this.cpu = cpu;
         this.launchType = launchType;
+        this.networkMode = networkMode;
         this.subnets = subnets;
         this.securityGroups = securityGroups;
         this.assignPublicIp = assignPublicIp;
@@ -289,6 +306,8 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
         this.extraHosts = extraHosts;
         this.mountPoints = mountPoints;
         this.portMappings = portMappings;
+        this.taskrole = taskrole;
+        this.inheritFrom = inheritFrom;
     }
 
     @DataBoundSetter
@@ -300,6 +319,11 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     public void setExecutionRole(String executionRole) {
         this.executionRole = StringUtils.trimToNull(executionRole);
     }
+
+    @DataBoundSetter
+    public void setRepositoryCredentials(final String repositoryCredentials) {
+        this.repositoryCredentials = StringUtils.trimToNull(repositoryCredentials);
+    }    
 
     @DataBoundSetter
     public void setEntrypoint(String entrypoint) {
@@ -319,6 +343,11 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     @DataBoundSetter
     public void setLogDriver(String logDriver) {
         this.logDriver = StringUtils.trimToNull(logDriver);
+    }
+
+    @DataBoundSetter
+    public void setInheritFrom(String inheritFrom) {
+        this.inheritFrom = inheritFrom;
     }
 
     @DataBoundSetter
@@ -392,6 +421,10 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
         return executionRole;
     }
 
+    public String getRepositoryCredentials() {
+        return repositoryCredentials;
+    }
+    
     public String getJvmArgs() {
         return jvmArgs;
     }
@@ -411,13 +444,22 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
         return launchType;
     }
 
+    public String getNetworkMode() {
+        return networkMode;
+    }
+
     public String getLogDriver() {
         return logDriver;
     }
 
+    public String getInheritFrom() {
+        return inheritFrom;
+    }
+
     public String getTemplateName() {return templateName; }
 
-    public static class LogDriverOption extends AbstractDescribableImpl<LogDriverOption>{
+    public static class LogDriverOption extends AbstractDescribableImpl<LogDriverOption> implements Serializable {
+        private static final long serialVersionUID = 8585792353105873086L;
         public String name, value;
 
         @DataBoundConstructor
@@ -471,6 +513,68 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     public List<PortMappingEntry> getPortMappings() {
         return portMappings;
     }
+
+    public ECSTaskTemplate merge(ECSTaskTemplate parent) {
+        if(parent == null) {
+            return this;
+        }
+
+        String templateName = Strings.isNullOrEmpty(this.templateName) ? parent.getTemplateName() : this.templateName;
+        String label = Strings.isNullOrEmpty(this.label) ? parent.getLabel() : this.label;
+        String taskDefinitionOverride = Strings.isNullOrEmpty(this.taskDefinitionOverride) ? parent.getTaskDefinitionOverride() : this.taskDefinitionOverride;
+        String image = Strings.isNullOrEmpty(this.image) ? parent.getImage() : this.image;
+        String repositoryCredentials = Strings.isNullOrEmpty(this.repositoryCredentials) ? parent.getRepositoryCredentials() : this.repositoryCredentials;
+        String launchType = Strings.isNullOrEmpty(this.launchType) ? parent.getLaunchType() : this.launchType;
+        String networkMode = Strings.isNullOrEmpty(this.networkMode) ? parent.getNetworkMode() : this.networkMode;
+        String remoteFSRoot = Strings.isNullOrEmpty(this.remoteFSRoot) ? parent.getRemoteFSRoot() : this.remoteFSRoot;
+        int memory = this.memory == 0 ? parent.getMemory() : this.memory;
+        int memoryReservation = this.memoryReservation == 0 ? parent.getMemoryReservation() : this.memoryReservation;
+        int cpu = this.cpu == 0 ? parent.getCpu() : this.cpu;
+        String subnets = Strings.isNullOrEmpty(this.subnets) ? parent.getSubnets() : this.subnets;
+        String securityGroups = Strings.isNullOrEmpty(this.securityGroups) ? parent.getSecurityGroups() : this.securityGroups;
+        boolean assignPublicIp = this.assignPublicIp ? this.assignPublicIp : parent.getAssignPublicIp();
+        boolean privileged = this.privileged ? this.privileged : parent.getPrivileged();
+        String containerUser = Strings.isNullOrEmpty(this.containerUser) ? parent.getContainerUser() : this.containerUser;
+        String logDriver = Strings.isNullOrEmpty(this.logDriver) ? parent.getLogDriver() : this.logDriver;
+
+        // TODO probably merge lists with parent instead of overriding them
+        List<LogDriverOption> logDriverOptions = CollectionUtils.isEmpty(this.logDriverOptions) ? parent.getLogDriverOptions() : this.logDriverOptions;
+        List<EnvironmentEntry> environments = CollectionUtils.isEmpty(this.environments) ? parent.getEnvironments() : this.environments;
+        List<ExtraHostEntry> extraHosts = CollectionUtils.isEmpty(this.extraHosts) ? parent.getExtraHosts() : this.extraHosts;
+        List<MountPointEntry> mountPoints = CollectionUtils.isEmpty(this.mountPoints) ? parent.getMountPoints() : this.mountPoints;
+        List<PortMappingEntry> portMappings = CollectionUtils.isEmpty(this.portMappings) ? parent.getPortMappings() : this.portMappings;
+
+        String taskrole = Strings.isNullOrEmpty(this.taskrole) ? parent.getTaskrole() : this.taskrole;
+
+        ECSTaskTemplate merged = new ECSTaskTemplate(templateName,
+                                                       label,
+                                                       taskDefinitionOverride,
+                                                       image,
+                                                       repositoryCredentials,
+                                                       launchType,
+                                                       networkMode,
+                                                       remoteFSRoot,
+                                                       memory,
+                                                       memoryReservation,
+                                                       cpu,
+                                                       subnets,
+                                                       securityGroups,
+                                                       assignPublicIp,
+                                                       privileged,
+                                                       containerUser,
+                                                       logDriverOptions,
+                                                       environments,
+                                                       extraHosts,
+                                                       mountPoints,
+                                                       portMappings,
+                                                       taskrole,
+                                                       null);
+        merged.setLogDriver(logDriver);
+
+        return merged;
+    }
+
+
 
     Collection<KeyValuePair> getEnvironmentKeyValuePairs() {
         if (null == environments || environments.isEmpty()) {
@@ -559,7 +663,8 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
         return ports;
     }
 
-    public static class EnvironmentEntry extends AbstractDescribableImpl<EnvironmentEntry> {
+    public static class EnvironmentEntry extends AbstractDescribableImpl<EnvironmentEntry> implements Serializable {
+        private static final long serialVersionUID = 4195862080979262875L;
         public String name, value;
 
         @DataBoundConstructor
@@ -582,7 +687,8 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
         }
     }
 
-    public static class ExtraHostEntry extends AbstractDescribableImpl<ExtraHostEntry> {
+    public static class ExtraHostEntry extends AbstractDescribableImpl<ExtraHostEntry> implements Serializable {
+        private static final long serialVersionUID = -23978859661031633L;
         public String ipAddress, hostname;
 
         @DataBoundConstructor
@@ -605,7 +711,8 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
         }
     }
 
-    public static class MountPointEntry extends AbstractDescribableImpl<MountPointEntry> {
+    public static class MountPointEntry extends AbstractDescribableImpl<MountPointEntry> implements Serializable {
+        private static final long serialVersionUID = -5363412950753423854L;
         public String name, sourcePath, containerPath;
         public Boolean readOnly;
 
@@ -637,7 +744,8 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
         }
     }
 
-    public static class PortMappingEntry extends AbstractDescribableImpl<PortMappingEntry> {
+    public static class PortMappingEntry extends AbstractDescribableImpl<PortMappingEntry> implements Serializable {
+        private static final long serialVersionUID = 8223725139080497839L;
         public Integer containerPort, hostPort;
         public String protocol;
 
@@ -677,7 +785,7 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
     }
 
     public String getDisplayName() {
-        return "ECS Slave " + label;
+        return "ECS Agent " + label;
     }
 
     @Extension
@@ -687,7 +795,7 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
 
         @Override
         public String getDisplayName() {
-            return Messages.Template();
+            return Messages.template();
         }
 
         public ListBoxModel doFillLaunchTypeItems() {
@@ -698,6 +806,19 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
             return options;
         }
 
+        public ListBoxModel doFillNetworkModeItems() {
+            final ListBoxModel options = new ListBoxModel();
+
+            //Need to support Windows Containers - Need to allow Default which equal Null
+            options.add("default");
+
+            for (NetworkMode networkMode: NetworkMode.values()) {
+                options.add(networkMode.toString());
+            }
+
+            return options;
+        }
+
         public FormValidation doCheckTemplateName(@QueryParameter String value) throws IOException, ServletException {
             if (value.length() > 0 && value.length() <= 127 && value.matches(TEMPLATE_NAME_PATTERN)) {
                 return FormValidation.ok();
@@ -705,9 +826,16 @@ public class ECSTaskTemplate extends AbstractDescribableImpl<ECSTaskTemplate> {
             return FormValidation.error("Up to 127 letters (uppercase and lowercase), numbers, hyphens, and underscores are allowed");
         }
 
-        public FormValidation doCheckSubnets(@QueryParameter("subnets") String subnets, @QueryParameter("launchType") String launchType) throws IOException, ServletException {
-            if (launchType.equals("FARGATE") && subnets.isEmpty()) {
+        public FormValidation doCheckSubnetsLaunchType(@QueryParameter("subnets") String subnets, @QueryParameter("launchType") String launchType) throws IOException, ServletException {
+            if (launchType.contentEquals(LaunchType.FARGATE.toString())) {
                 return FormValidation.error("Subnets need to be set, when using FARGATE");
+            }
+            return FormValidation.ok();
+        }
+
+        public FormValidation doCheckSubnetsNetworkMode(@QueryParameter("subnets") String subnets, @QueryParameter("networkMode") String networkMode) throws IOException, ServletException {
+            if (networkMode.equals(NetworkMode.Awsvpc.toString()) && subnets.isEmpty()) {
+                return FormValidation.error("Subnets need to be set when using awsvpc network mode");
             }
             return FormValidation.ok();
         }

@@ -23,5 +23,11 @@
   ~
   -->
 
-You can rely on this option to overwrite the Docker image entrypoint. Container command can't be overriden as it
-is used to pass jenkins agent connection parameters. White list separated
+The network mode to apply to the task. See <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html#network_mode" target="_blank">Network Mode</a> for more details.</br>
+</br>
+If using <b>awsvpc</b>, you must specify <b>Subnets</b> and can optionally specify <b>Security Groups</b> and <b>Assign Public IP</b>.<br>
+<br>
+Using the <b>none</b> mode will result in your agent having no network connectivity.
+<br>
+<br>
+Using the <b>default</b> network mode is required for Windows containers on EC2 ECS.  Mapping <b>default</b> to a Null network mode.  See <a href="https://docs.aws.amazon.com/AmazonECS/latest/developerguide/windows_task_definitions.html" target="_blank">Windows Containers</a>

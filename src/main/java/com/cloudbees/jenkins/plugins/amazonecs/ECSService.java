@@ -26,59 +26,47 @@
 package com.cloudbees.jenkins.plugins.amazonecs;
 
 import java.io.IOException;
-import java.text.MessageFormat;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Date;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import javax.annotation.CheckForNull;
 import javax.annotation.Nullable;
 
-
-import com.amazonaws.services.ecs.model.ClientException;
-import com.amazonaws.services.ecs.model.TaskDefinition;
-import org.apache.commons.lang.ObjectUtils;
-import org.apache.commons.lang.StringUtils;
-
 import com.amazonaws.ClientConfiguration;
 import com.amazonaws.regions.Region;
 import com.amazonaws.regions.RegionUtils;
 import com.amazonaws.regions.Regions;
-import com.amazonaws.services.ecs.AmazonECSClient;
+import com.amazonaws.services.ecs.AmazonECS;
+import com.amazonaws.services.ecs.AmazonECSClientBuilder;
 import com.amazonaws.services.ecs.model.AwsVpcConfiguration;
+import com.amazonaws.services.ecs.model.ClientException;
 import com.amazonaws.services.ecs.model.ContainerDefinition;
-import com.amazonaws.services.ecs.model.ContainerInstance;
 import com.amazonaws.services.ecs.model.ContainerOverride;
-import com.amazonaws.services.ecs.model.DescribeContainerInstancesRequest;
-import com.amazonaws.services.ecs.model.DescribeContainerInstancesResult;
+import com.amazonaws.services.ecs.model.DeregisterTaskDefinitionRequest;
 import com.amazonaws.services.ecs.model.DescribeTaskDefinitionRequest;
 import com.amazonaws.services.ecs.model.DescribeTaskDefinitionResult;
-import com.amazonaws.services.ecs.model.Failure;
+import com.amazonaws.services.ecs.model.DescribeTasksRequest;
+import com.amazonaws.services.ecs.model.DescribeTasksResult;
 import com.amazonaws.services.ecs.model.KeyValuePair;
 import com.amazonaws.services.ecs.model.LaunchType;
-import com.amazonaws.services.ecs.model.ListContainerInstancesRequest;
-import com.amazonaws.services.ecs.model.ListContainerInstancesResult;
 import com.amazonaws.services.ecs.model.LogConfiguration;
 import com.amazonaws.services.ecs.model.NetworkConfiguration;
 import com.amazonaws.services.ecs.model.RegisterTaskDefinitionRequest;
 import com.amazonaws.services.ecs.model.RegisterTaskDefinitionResult;
-import com.amazonaws.services.ecs.model.Resource;
+import com.amazonaws.services.ecs.model.RepositoryCredentials;
 import com.amazonaws.services.ecs.model.RunTaskRequest;
 import com.amazonaws.services.ecs.model.RunTaskResult;
 import com.amazonaws.services.ecs.model.StopTaskRequest;
+import com.amazonaws.services.ecs.model.Task;
+import com.amazonaws.services.ecs.model.TaskDefinition;
 import com.amazonaws.services.ecs.model.TaskOverride;
-import org.apache.commons.lang.ObjectUtils;
-import org.apache.commons.lang.StringUtils;
-
-import com.amazonaws.ClientConfiguration;
-import com.amazonaws.regions.Region;
-import com.amazonaws.regions.RegionUtils;
-import com.amazonaws.regions.Regions;
-import com.amazonaws.services.ecs.AmazonECSClient;
 import com.cloudbees.jenkins.plugins.awscredentials.AWSCredentialsHelper;
 import com.cloudbees.jenkins.plugins.awscredentials.AmazonWebServicesCredentials;
+
+import org.apache.commons.lang.ObjectUtils;
+import org.apache.commons.lang.StringUtils;
 
 import hudson.AbortException;
 import hudson.ProxyConfiguration;
@@ -103,11 +91,10 @@ class ECSService {
         this.regionName = regionName;
     }
 
-    AmazonECSClient getAmazonECSClient() {
-        final AmazonECSClient client;
-
-        ProxyConfiguration proxy = Jenkins.getInstance().proxy;
+    AmazonECS getAmazonECSClient() {
+        ProxyConfiguration proxy = Jenkins.get().proxy;
         ClientConfiguration clientConfiguration = new ClientConfiguration();
+
         if(proxy != null) {
             clientConfiguration.setProxyHost(proxy.name);
             clientConfiguration.setProxyPort(proxy.port);
@@ -115,22 +102,24 @@ class ECSService {
             clientConfiguration.setProxyPassword(proxy.getPassword());
         }
 
+        AmazonECSClientBuilder builder = AmazonECSClientBuilder
+                    .standard()
+                    .withClientConfiguration(clientConfiguration)
+                    .withRegion(regionName);
+        
         AmazonWebServicesCredentials credentials = getCredentials(credentialsId);
-        if (credentials == null) {
-            // no credentials provided, rely on com.amazonaws.auth.DefaultAWSCredentialsProviderChain
-            // to use IAM Role define at the EC2 instance level ...
-            client = new AmazonECSClient(clientConfiguration);
-        } else {
+        if (credentials != null) {
             if (LOGGER.isLoggable(Level.FINE)) {
                 String awsAccessKeyId = credentials.getCredentials().getAWSAccessKeyId();
                 String obfuscatedAccessKeyId = StringUtils.left(awsAccessKeyId, 4) + StringUtils.repeat("*", awsAccessKeyId.length() - (2 * 4)) + StringUtils.right(awsAccessKeyId, 4);
                 LOGGER.log(Level.FINE, "Connect to Amazon ECS with IAM Access Key {1}", new Object[]{obfuscatedAccessKeyId});
             }
-            client = new AmazonECSClient(credentials, clientConfiguration);
+            builder
+                .withCredentials(credentials);
         }
-        client.setRegion(getRegion(regionName));
         LOGGER.log(Level.FINE, "Selected Region: {0}", regionName);
-        return client;
+
+        return builder.build();
     }
 
     Region getRegion(String regionName) {
@@ -143,15 +132,27 @@ class ECSService {
 
     @CheckForNull
     private AmazonWebServicesCredentials getCredentials(@Nullable String credentialsId) {
-        return AWSCredentialsHelper.getCredentials(credentialsId, Jenkins.getActiveInstance());
+        return AWSCredentialsHelper.getCredentials(credentialsId, Jenkins.get());
     }
 
-    void deleteTask(String taskArn, String clusterArn) {
-        final AmazonECSClient client = getAmazonECSClient();
+    public Task describeTask(String taskArn, String clusterArn) {
+        final AmazonECS client = getAmazonECSClient();
 
-        LOGGER.log(Level.INFO, "Delete ECS Slave task: {0}", taskArn);
+        DescribeTasksResult result = client.describeTasks(new DescribeTasksRequest().withCluster(clusterArn).withTasks(taskArn));
+
+        if (result.getTasks().size() == 0) {
+            return null;
+        } else {
+            return result.getTasks().get(0);
+        }
+    }
+
+    public void stopTask(String taskArn, String clusterArn) {
+        final AmazonECS client = getAmazonECSClient();
+
+        LOGGER.log(Level.INFO, "Delete ECS agent task: {0}", taskArn);
         try {
-            client.stopTask(new StopTaskRequest().withTask(taskArn).withCluster(clusterArn));
+            client.stopTask(new StopTaskRequest().withTask(taskArn).withCluster(clusterArn).withReason("Stopped by Jenkins Amazon ECS PlugIn"));
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Couldn't stop task arn " + taskArn + " caught exception: " + e.getMessage(), e);
         }
@@ -162,7 +163,7 @@ class ECSService {
      * If no, register a new task definition with desired parameters and returns the new TaskDefinition.
      */
     TaskDefinition registerTemplate(final ECSCloud cloud, final ECSTaskTemplate template) {
-        final AmazonECSClient client = getAmazonECSClient();
+        final AmazonECS client = getAmazonECSClient();
         
         String familyName = fullQualifiedTemplateName(cloud, template);
         final ContainerDefinition def = new ContainerDefinition()
@@ -183,7 +184,6 @@ class ECSService {
         if (template.getMemoryReservation() > 0) /* this is the soft limit */
             def.withMemoryReservation(template.getMemoryReservation());
 
-
         if (template.getMemory() > 0) /* this is the hard limit */
             def.withMemory(template.getMemory());
 
@@ -200,6 +200,9 @@ class ECSService {
         
         if (template.getContainerUser() != null)
             def.withUser(template.getContainerUser());
+        
+        if (template.getRepositoryCredentials() != null)
+            def.withRepositoryCredentials(new RepositoryCredentials().withCredentialsParameter(template.getRepositoryCredentials()));
 
         if (template.getLogDriver() != null) {
             LogConfiguration logConfig = new LogConfiguration();
@@ -214,26 +217,43 @@ class ECSService {
         boolean templateMatchesExistingVolumes = false;
         boolean templateMatchesExistingTaskRole = false;
         boolean templateMatchesExistingExecutionRole = false;
+        boolean templateMatchesExistingNetworkMode = false;
 
         if (currentTaskDefinition != null) {
-            templateMatchesExistingContainerDefinition = def.equals(currentTaskDefinition.getContainerDefinitions().get(0));
+            final ContainerDefinition currentContainerDefinition = currentTaskDefinition.getContainerDefinitions().get(0);
+
+            templateMatchesExistingContainerDefinition = def.equals(currentContainerDefinition);
             LOGGER.log(Level.INFO, "Match on container definition: {0}", new Object[] {templateMatchesExistingContainerDefinition});
-            LOGGER.log(Level.FINE, "Match on container definition: {0}; template={1}; last={2}", new Object[] {templateMatchesExistingContainerDefinition, def, currentTaskDefinition.getContainerDefinitions().get(0)});
+            LOGGER.log(Level.FINE, "Match on container definition: {0}; template={1}; last={2}", new Object[] {templateMatchesExistingContainerDefinition, def, currentContainerDefinition});
 
             templateMatchesExistingVolumes = ObjectUtils.equals(template.getVolumeEntries(), currentTaskDefinition.getVolumes());
             LOGGER.log(Level.INFO, "Match on volumes: {0}", new Object[] {templateMatchesExistingVolumes});
             LOGGER.log(Level.FINE, "Match on volumes: {0}; template={1}; last={2}", new Object[] {templateMatchesExistingVolumes, template.getVolumeEntries(), currentTaskDefinition.getVolumes()});
 
-            templateMatchesExistingTaskRole = template.getTaskrole() == null || template.getTaskrole().equals(currentTaskDefinition.getTaskRoleArn());
+            templateMatchesExistingTaskRole = StringUtils.equals(StringUtils.defaultString(template.getTaskrole()), StringUtils.defaultString(currentTaskDefinition.getTaskRoleArn()));
             LOGGER.log(Level.INFO, "Match on task role: {0}", new Object[] {templateMatchesExistingTaskRole});
             LOGGER.log(Level.FINE, "Match on task role: {0}; template={1}; last={2}", new Object[] {templateMatchesExistingTaskRole, template.getTaskrole(), currentTaskDefinition.getTaskRoleArn()});
 
-            templateMatchesExistingExecutionRole = template.getExecutionRole() == null || template.getExecutionRole().equals(currentTaskDefinition.getExecutionRoleArn());
+            templateMatchesExistingExecutionRole = StringUtils.equals(StringUtils.defaultString(template.getExecutionRole()), StringUtils.defaultString(currentTaskDefinition.getExecutionRoleArn()));
             LOGGER.log(Level.INFO, "Match on execution role: {0}", new Object[] {templateMatchesExistingExecutionRole});
             LOGGER.log(Level.FINE, "Match on execution role: {0}; template={1}; last={2}", new Object[] {templateMatchesExistingExecutionRole, template.getExecutionRole(), currentTaskDefinition.getExecutionRoleArn()});
+
+            //Compare to null if it is default network mode is selected
+            String templateNetworkMode = "";
+            if(StringUtils.equals(StringUtils.defaultString(template.getNetworkMode()),"default")){
+                templateMatchesExistingNetworkMode = null == currentTaskDefinition.getNetworkMode(); 
+                templateNetworkMode="null";
+            }
+            else{
+                templateMatchesExistingNetworkMode = StringUtils.equals(StringUtils.defaultString(template.getNetworkMode()), StringUtils.defaultString(currentTaskDefinition.getNetworkMode()));
+                templateNetworkMode=template.getNetworkMode();
+            }
+
+            LOGGER.log(Level.INFO, "Match on network mode: {0}", new Object[] {templateMatchesExistingNetworkMode});
+            LOGGER.log(Level.FINE, "Match on network mode: {0}; template={1}; last={2}", new Object[] {templateMatchesExistingNetworkMode, templateNetworkMode, currentTaskDefinition.getNetworkMode()});
         }
-        
-        if(templateMatchesExistingContainerDefinition && templateMatchesExistingVolumes && templateMatchesExistingTaskRole && templateMatchesExistingExecutionRole) {
+
+        if(templateMatchesExistingContainerDefinition && templateMatchesExistingVolumes && templateMatchesExistingTaskRole && templateMatchesExistingExecutionRole && templateMatchesExistingNetworkMode) {
             LOGGER.log(Level.FINE, "Task Definition already exists: {0}", new Object[]{currentTaskDefinition.getTaskDefinitionArn()});
             return currentTaskDefinition;
         } else {
@@ -242,24 +262,49 @@ class ECSService {
                     .withVolumes(template.getVolumeEntries())
                     .withContainerDefinitions(def);
 
+            //If network mode is default, that means Null in the request, so do not set.
+            if(!StringUtils.equals(StringUtils.defaultString(template.getNetworkMode()),"default")){
+                request.withNetworkMode(template.getNetworkMode());
+            }
+
+            if(!StringUtils.isEmpty(template.getExecutionRole())){
+                request.withExecutionRoleArn(template.getExecutionRole());
+            }
+
+            if (!StringUtils.isEmpty(template.getTaskrole())) {
+                request.withTaskRoleArn(template.getTaskrole());
+            } 
+
             if (template.isFargate()) {
                 request
                         .withRequiresCompatibilities(template.getLaunchType())
                         .withNetworkMode("awsvpc")
                         .withMemory(String.valueOf(template.getMemoryConstraint()))
                         .withCpu(String.valueOf(template.getCpu()));
-                String executionRole = template.getExecutionRole();
-                if(!StringUtils.isEmpty(executionRole)){
-                    request.withExecutionRoleArn(executionRole);
-                }
             }
-            if (template.getTaskrole() != null) {
-                request.withTaskRoleArn(template.getTaskrole());
-            }            
+
             final RegisterTaskDefinitionResult result = client.registerTaskDefinition(request);
             LOGGER.log(Level.FINE, "Created Task Definition {0}: {1}", new Object[]{result.getTaskDefinition(), request});
             LOGGER.log(Level.INFO, "Created Task Definition: {0}", new Object[]{result.getTaskDefinition()});
             return result.getTaskDefinition();
+        }
+    }
+
+    void removeTemplate(final ECSCloud cloud, final ECSTaskTemplate template) {
+        AmazonECS client = getAmazonECSClient();
+
+        String familyName = fullQualifiedTemplateName(cloud, template);
+
+        int revision = findTaskDefinition(familyName).getRevision();
+
+        try {
+            client.deregisterTaskDefinition(
+                    new DeregisterTaskDefinitionRequest()
+                            .withTaskDefinition(familyName + ":" + revision));
+
+        } catch (ClientException e) {
+            LOGGER.log(Level.FINE, "Error removing task definition: " + familyName + ":" + revision, e);
+            LOGGER.log(Level.INFO, "Error removing task definition: " + familyName + ":" + revision);
         }
     }
 
@@ -268,7 +313,7 @@ class ECSService {
      * The parameter may be a task definition family, family with revision, or full task definition ARN.
      */
     TaskDefinition findTaskDefinition(String familyOrArn) {
-        AmazonECSClient client = getAmazonECSClient();
+        AmazonECS client = getAmazonECSClient();
 
         try {
             DescribeTaskDefinitionResult result = client.describeTaskDefinition(
@@ -288,37 +333,37 @@ class ECSService {
         return cloud.getDisplayName().replaceAll("\\s+","") + '-' + template.getTemplateName();
     }
 
-    String runEcsTask(final ECSSlave slave, final ECSTaskTemplate template, String clusterArn, Collection<String> command, TaskDefinition taskDefinition) throws IOException, AbortException {
-        AmazonECSClient client = getAmazonECSClient();
-        slave.setTaskDefinitonArn(taskDefinition.getTaskDefinitionArn());
+    RunTaskResult runEcsTask(final ECSSlave agent, final ECSTaskTemplate template, String clusterArn, Collection<String> command, TaskDefinition taskDefinition) throws IOException, AbortException {
+        AmazonECS client = getAmazonECSClient();
+        agent.setTaskDefinitonArn(taskDefinition.getTaskDefinitionArn());
 
         KeyValuePair envNodeName = new KeyValuePair();
         envNodeName.setName("SLAVE_NODE_NAME");
-        envNodeName.setValue(slave.getComputer().getName());
+        envNodeName.setValue(agent.getComputer().getName());
 
         KeyValuePair envNodeSecret = new KeyValuePair();
         envNodeSecret.setName("SLAVE_NODE_SECRET");
-        envNodeSecret.setValue(slave.getComputer().getJnlpMac());
+        envNodeSecret.setValue(agent.getComputer().getJnlpMac());
 
-        // by convention, we assume the jenkins slave container is the first container in the task definition. ECS requires
+        // by convention, we assume the jenkins agent container is the first container in the task definition. ECS requires
         // all task definitions to contain at least one container, and all containers to have a name, so we do not need
         // to null- or bounds-check for the presence of a container definition.
-        String slaveContainerName = taskDefinition.getContainerDefinitions().get(0).getName();
+        String agentContainerName = taskDefinition.getContainerDefinitions().get(0).getName();
 
-        LOGGER.log(Level.FINE, "Found container definition with {0} container(s). Assuming first container is the Jenkins slave: {1}", new Object[]{taskDefinition.getContainerDefinitions().size(), slaveContainerName});
+        LOGGER.log(Level.FINE, "Found container definition with {0} container(s). Assuming first container is the Jenkins agent: {1}", new Object[]{taskDefinition.getContainerDefinitions().size(), agentContainerName});
 
         RunTaskRequest req = new RunTaskRequest()
                 .withTaskDefinition(taskDefinition.getTaskDefinitionArn())
                 .withLaunchType(LaunchType.fromValue(template.getLaunchType()))
                 .withOverrides(new TaskOverride()
                         .withContainerOverrides(new ContainerOverride()
-                                .withName(slaveContainerName)
+                                .withName(agentContainerName)
                                 .withCommand(command)
                                 .withEnvironment(envNodeName)
                                 .withEnvironment(envNodeSecret)))
                 .withCluster(clusterArn);
 
-        if (template.isFargate()) {
+        if (taskDefinition.getNetworkMode()!=null && taskDefinition.getNetworkMode().equals("awsvpc")) {
             AwsVpcConfiguration awsVpcConfiguration = new AwsVpcConfiguration();
             awsVpcConfiguration.setAssignPublicIp(template.getAssignPublicIp() ? "ENABLED" : "DISABLED");
             awsVpcConfiguration.setSecurityGroups(Arrays.asList(template.getSecurityGroups().split(",")));
@@ -329,57 +374,7 @@ class ECSService {
 
             req.withNetworkConfiguration(networkConfiguration);
         }
-        final RunTaskResult runTaskResult = client.runTask(req);
-
-
-        if (!runTaskResult.getFailures().isEmpty()) {
-            LOGGER.log(Level.WARNING, "Slave {0} - Failure to run task with definition {1} on ECS cluster {2}", new Object[]{slave.getNodeName(), taskDefinition.getTaskDefinitionArn(), clusterArn});
-            for (Failure failure : runTaskResult.getFailures()) {
-                LOGGER.log(Level.WARNING, "Slave {0} - Failure reason={1}, arn={2}", new Object[]{slave.getNodeName(), failure.getReason(), failure.getArn()});
-            }
-            throw new AbortException("Failed to run slave container " + slave.getNodeName());
-        }
-        return runTaskResult.getTasks().get(0).getTaskArn();
+        return client.runTask(req);
     }
 
-    void waitForSufficientClusterResources(Date timeout, ECSTaskTemplate template, String clusterArn) throws InterruptedException, AbortException {
-        AmazonECSClient client = getAmazonECSClient();
-
-        boolean hasEnoughResources = false;
-        WHILE:
-        do {
-            ListContainerInstancesResult listContainerInstances = client.listContainerInstances(new ListContainerInstancesRequest().withCluster(clusterArn));
-            DescribeContainerInstancesResult containerInstancesDesc = client.describeContainerInstances(new DescribeContainerInstancesRequest().withContainerInstances(listContainerInstances.getContainerInstanceArns()).withCluster(clusterArn));
-            LOGGER.log(Level.INFO, "Found {0} instances", containerInstancesDesc.getContainerInstances().size());
-            for(ContainerInstance instance : containerInstancesDesc.getContainerInstances()) {
-                LOGGER.log(Level.INFO, "Resources found in instance {1}: {0}", new Object[] {instance.getRemainingResources(), instance.getContainerInstanceArn()});
-                Resource memoryResource = null;
-                Resource cpuResource = null;
-                for(Resource resource : instance.getRemainingResources()) {
-                    if("MEMORY".equals(resource.getName())) {
-                        memoryResource = resource;
-                    } else if("CPU".equals(resource.getName())) {
-                        cpuResource = resource;
-                    }
-                }
-
-                LOGGER.log(Level.INFO, "Instance {0} has {1}mb of free memory. {2}mb are required", new Object[]{ instance.getContainerInstanceArn(), memoryResource.getIntegerValue(), template.getMemoryConstraint()});
-                LOGGER.log(Level.INFO, "Instance {0} has {1} units of free cpu. {2} units are required", new Object[]{ instance.getContainerInstanceArn(), cpuResource.getIntegerValue(), template.getCpu()});
-                if(memoryResource.getIntegerValue() >= template.getMemoryConstraint()
-                        && cpuResource.getIntegerValue() >= template.getCpu()) {
-                    hasEnoughResources = true;
-                    break WHILE;
-                }
-            }
-
-            // sleep 10s and check memory again
-            Thread.sleep(10000);
-        } while(!hasEnoughResources && timeout.after(new Date()));
-
-        if(!hasEnoughResources) {
-            final String msg = MessageFormat.format("Timeout while waiting for sufficient resources: {0} cpu units, {1}mb free memory", template.getCpu(), template.getMemoryConstraint());
-            LOGGER.log(Level.WARNING, msg);
-            throw new AbortException(msg);
-        }
-    }
 }
